@@ -1,0 +1,19 @@
+venv/
+__pycache__/
+*.pyc
+
+# configuracion local de Claude Code (permisos de esta maquina, no del proyecto)
+.claude/
+
+# variables de entorno con claves de API (usa el fichero de ejemplo)
+.env
+
+# datos personales / generados en cada instalación
+data/voices/*.npy
+data/logs/
+data/temp_audio/
+data/memory.md
+
+# modelo de voz de Piper (se descarga aparte, ver README)
+data/piper/*.onnx
+data/piper/*.onnx.json

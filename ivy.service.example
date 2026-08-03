@@ -1,0 +1,13 @@
+[Unit]
+Description=E.V - asistente de voz integrado
+After=graphical-session.target
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/ruta/a/ivy/venv/bin/python /ruta/a/ivy/main.py
+WorkingDirectory=/ruta/a/ivy
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

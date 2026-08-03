@@ -1,0 +1,40 @@
+# Dependencias del Asistente de Voz
+# Instalar con: pip install -r requirements.txt
+
+# Leer variables del archivo de configuracion
+python-dotenv>=1.0.0
+
+# Detector de atajo de teclado global
+pynput>=1.7.6
+
+# Captura de audio desde el microfono
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Transcripcion de voz a texto (Whisper local, sin API key)
+faster-whisper>=1.0.0
+
+# Cliente de la API de Anthropic (Claude)
+anthropic>=0.40.0
+
+# Text-to-Speech local (Piper, onnx) -- sin nube, sin API key, sin depender
+# de internet. Modelo de voz en data/piper/ (ver src/tts.py).
+piper-tts>=1.6.0
+
+# Reproductor de audio: usamos mpv del sistema (ya instalado en CachyOS)
+# No necesita instalacion via pip
+
+# Reconocimiento de voz (distinguir quien habla): modelo neuronal.
+# IMPORTANTE: instalar torch primero desde el indice CPU-only, si no pip instala la build
+# con CUDA y arrastra ~3GB de paquetes nvidia-* inutiles (esta maquina tiene GPU AMD):
+#   venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   venv/bin/python -m pip install -r requirements.txt
+# resemblyzer depende de webrtcvad, cuyo wrapper Python necesita pkg_resources, retirado
+# de setuptools >=81 -- de ahi el pin de abajo (verificado en Python 3.14).
+torch>=2.13.0
+resemblyzer>=0.1.4
+setuptools<81
+
+# Opcional: si quieres usar OpenAI en lugar de Claude
+# openai>=1.0.0
