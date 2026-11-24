@@ -195,38 +195,41 @@ Tras cambiar cualquier valor: `systemctl --user restart ivy.service`.
 
 ## Comandos peligrosos y privilegios
 
-E.V puede ejecutar comandos de shell, abrir aplicaciones y escribir texto por
-ti (`src/system_tools.py`). Hay dos capas de seguridad, con distinto grado
-de flexibilidad:
+E.V puede ejecutar comandos, abrir aplicaciones y escribir texto por ti
+(`src/system_tools.py`). El modelo de seguridad está tomado del fork
+[Aria](https://gitlab.com/Relieving/aria) y ampliado:
 
-1. **`sudo` bloqueado siempre, sin excepción.** `run_shell_command` rechaza
-   cualquier comando que contenga `sudo`, pase lo que pase — no depende de
-   quién habla ni de configuración. Para levantar esto haría falta editar
-   el código (`src/system_tools.py`, función `run_shell_command`); no es
-   algo pensado para activarse, ya que le daría a E.V control total del
-   sistema a partir de una transcripción de voz.
+1. **Nunca hay shell.** El comando se parte con `shlex` y se ejecuta como
+   lista de argumentos (`shell=False`). No hay tuberías, redirecciones, `;`,
+   `&&`, variables ni `$(...)`: si el texto los trae, se rechaza. Antes se
+   usaba `bash -c` con una lista negra de expresiones regulares, y trucos
+   como `s\udo` o `$(printf 'sud\157')` se la saltaban.
 
-2. **`DANGER_PATTERNS` — confirmación hablada obligatoria.** En
-   `src/system_tools.py` hay una lista de patrones (borrado recursivo,
-   formatear un disco, escribir bytes en bruto sobre un disco,
-   apagar/reiniciar, parar servicios, cambiar contraseñas, crear/borrar
-   usuarios, dar permisos totales de forma recursiva sobre `/`, forzar un
-   `push` de git...). Si un comando coincide, no se ejecuta directamente:
-   E.V pregunta en voz alta "Vas a ejecutar: `<comando>`. ¿Confirmas?" y
-   solo lo lanza si quien confirma es la voz del **propietario** (perfil
-   `owner`, ver más arriba). Si nadie ha enrolado ninguna voz todavía,
-   cualquiera puede confirmar (no hay forma de distinguir quién habla).
-
-   Para dar más (o menos) privilegios, edita la lista de patrones en
+2. **Lista blanca, no lista negra.** Solo se ejecuta lo listado en
    `src/system_tools.py`:
-   - Añadir un patrón nuevo → ese tipo de comando pasará a pedir
-     confirmación del propietario antes de ejecutarse.
-   - Quitar un patrón existente → ese tipo de comando se ejecutará
-     directamente, sin pedir permiso. Solo recomendable si entiendes bien
-     el riesgo del patrón que quitas.
-   - Los patrones son regex de Python, insensibles a mayúsculas, y se
-     combinan con OR — basta con que el comando contenga uno de ellos en
-     cualquier parte.
+   - `SOLO_LECTURA` (`ls`, `cat`, `grep`, `find`, `df`, `ps`, `journalctl`…):
+     directos.
+   - `MODIFICAN` (`rm`, `mv`, `cp`, `mkdir`, `chmod`, `kill`…): piden
+     confirmación hablada.
+   - `SUBCOMANDOS` (`git`, `systemctl`, `docker`, `flatpak`, `pacman`): los de
+     consulta van directos y el resto se confirma.
+   - Todo lo demás se rechaza **por omisión**: `sudo`, `su`, `pkexec`, `bash`,
+     `python`, `curl`, `sed`, `awk`…
+   - `ARGS_PROHIBIDOS` veta argumentos que convierten un comando permitido en
+     ejecución o escritura arbitraria (`find -exec`, `fd -x`, `git -c`,
+     `sort -o`, `tar -I`…).
+
+   Si añades un binario a `SOLO_LECTURA`, comprueba antes que no puede ejecutar
+   código ni escribir ficheros. Tras tocar las listas, pasa
+   `venv/bin/python tests/test_lista_blanca.py`.
+
+   `type_text` **siempre** pide confirmación: con una terminal enfocada,
+   teclear equivale a ejecutar cualquier cosa.
+
+   La confirmación funciona así: E.V pregunta en voz alta "Vas a ejecutar:
+   `<comando>`. ¿Confirmas?" y solo lo lanza si quien confirma es la voz del
+   **propietario** (perfil `owner`). Si nadie ha enrolado ninguna voz, puede
+   confirmar cualquiera.
 
 3. **Quién puede confirmar**: lo decide `_current_is_owner` en
    `src/ai_client.py`, que se rellena con el resultado de
@@ -265,3 +268,10 @@ venv/bin/python main.py
   etc. bajan el score).
 - **No hay sonido de respuesta**: comprueba que `mpv` está instalado
   (`mpv --version`).
+
+## Licencia
+
+MIT-0 (ver [LICENSE](LICENSE)). En cristiano: libre uso total, me la pela lo que
+hagáis con este repositorio. Copiadlo, cambiadlo, vendedlo o lo que os dé la gana,
+sin pedir permiso ni tener que mencionarme. Eso sí, si algo se rompe no es
+problema mío.

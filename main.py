@@ -22,7 +22,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from src.hotkey import HotkeyListener
 from src.listener import ContinuousListener
@@ -93,8 +95,11 @@ def _on_utterance(audio_path: str) -> None:
 
     _processing = True
     try:
+        # STT e identificacion de voz son independientes: en paralelo, el
+        # tiempo es el del mas lento en vez de la suma.
+        fut_speaker = _pool.submit(speaker_id.identify, audio_path)
         texto = stt.transcribe(audio_path)
-        speaker_name, is_owner, score = speaker_id.identify(audio_path)
+        speaker_name, is_owner, score = fut_speaker.result()
     finally:
         _cleanup(audio_path)
 
@@ -125,22 +130,48 @@ def _on_utterance(audio_path: str) -> None:
         _processing = False
         return
 
+    stream = None
     try:
-        respuesta = ai_client.chat(texto, speaker_name=speaker_name, is_owner=is_owner)
-        print(f"  E.V: {respuesta}\n")
-
+        # Se mutea antes de llamar al LLM: la voz empieza a salir por frases
+        # mientras la respuesta aun se esta generando (streaming).
         listener.mute(on_barge_in=tts.stop)
-        tts.speak(respuesta)
-        listener.unmute()
+        stream = tts.start_stream()
+        respuesta = ai_client.chat(
+            texto, speaker_name=speaker_name, is_owner=is_owner, on_sentence=stream.say
+        )
+        print(f"  E.V: {respuesta}\n")
+        stream.finish()
     except Exception as e:
         logger.log_error(f"Error procesando turno: {e}")
         print(f"  [Error: {e}]")
+        if stream:
+            stream.cancel()
+            stream.finish()
     finally:
+        listener.unmute()
         _processing = False
 
 
 listener = ContinuousListener(_on_utterance)
 ai_client.set_listener(listener)
+
+_pool = ThreadPoolExecutor(max_workers=2)
+
+
+def _preload() -> None:
+    """
+    Carga Whisper, Piper, el codificador de voz y la conexion a la API en un
+    hilo al arrancar el servicio, para que el primer turno no pague ~3 s de
+    cargas perezosas. Cuesta algo de RAM en reposo a cambio de rapidez.
+    """
+    t0 = time.time()
+    for nombre, fn in (("stt", stt.warm_up), ("tts", tts.warm_up),
+                       ("voz", speaker_id.warm_up), ("api", ai_client.warm_up)):
+        try:
+            fn()
+        except Exception as e:
+            logger.log_error(f"Precarga de {nombre} fallo: {e}")
+    print(f"  [Modelos precargados en {time.time() - t0:.1f}s]")
 
 
 def _activate() -> None:
@@ -192,6 +223,7 @@ def main():
         key=config.HOTKEY_KEY
     )
     hotkey_listener.start()
+    threading.Thread(target=_preload, daemon=True).start()
 
     print("  Lista. Esperando...\n")
 

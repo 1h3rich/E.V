@@ -16,10 +16,13 @@ El bucle funciona asi:
   3. Repetimos hasta que Claude da una respuesta de texto final.
 """
 
+import json
 import os
+import re
 import time
 
 import anthropic
+import httpx
 from src import config, file_tools, system_tools, web_tools, media_tools, memory_tools
 from src import recorder as recorder_module
 from src import stt, tts, logger, speaker_id
@@ -90,10 +93,12 @@ def set_listener(listener_instance) -> None:
     _listener = listener_instance
 
 
-def chat(text: str, speaker_name: str = None, is_owner: bool = False) -> str:
+def chat(text: str, speaker_name: str = None, is_owner: bool = False, on_sentence=None) -> str:
     """
     Recibe el texto del usuario y devuelve la respuesta final de la IA.
     Gestiona automaticamente el uso de herramientas si Claude las necesita.
+    on_sentence(frase): si se indica, se llama con cada frase segun se genera
+    (para empezar a hablar antes de que termine la respuesta completa).
 
     speaker_name/is_owner: identidad detectada por speaker_id.identify() para
     este turno (None/False si no hay ningun perfil de voz enrolado o no hubo match).
@@ -104,10 +109,20 @@ def chat(text: str, speaker_name: str = None, is_owner: bool = False) -> str:
 
     _history.append({"role": "user", "content": text})
 
-    if config.AI_PROVIDER == "claude":
-        response = _call_claude()
+    if config.AI_PROVIDER == "ollama":
+        try:
+            response = _call_ollama(on_sentence)
+        except httpx.ConnectError:
+            if not config.ANTHROPIC_KEY:
+                raise
+            logger.log_error("Ollama no responde: usando Claude para este turno")
+            response = _call_claude(on_sentence)
+    elif config.AI_PROVIDER == "claude":
+        response = _call_claude(on_sentence)
     elif config.AI_PROVIDER == "openai":
         response = _call_openai()
+        if on_sentence:
+            on_sentence(response)
     else:
         raise ValueError(f"Proveedor desconocido: {config.AI_PROVIDER}")
 
@@ -147,12 +162,143 @@ def _build_system_prompt() -> str:
     return prompt
 
 
-def _call_claude() -> str:
+_client = None
+
+
+def get_client():
+    """Cliente de Anthropic reutilizado: mantiene la conexion TLS abierta entre turnos."""
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=config.ANTHROPIC_KEY)
+    return _client
+
+
+def warm_up() -> None:
+    """Carga el modelo local en VRAM (o abre la conexion TLS con Claude) antes del primer turno."""
+    try:
+        if config.AI_PROVIDER == "ollama":
+            # Mismas opciones que un turno real (un num_ctx distinto obliga a
+            # recargar el modelo) y mismo prefijo system+tools, que queda en la
+            # cache de Ollama y no hay que reprocesarlo en el primer turno.
+            _ollama.post("/api/chat", json={
+                **_ollama_request([
+                    {"role": "system", "content": _build_system_prompt()},
+                    {"role": "user", "content": "hola"},
+                ]),
+                "stream": False,
+                "options": {**_OLLAMA_OPTIONS, "num_predict": 1},
+            }, timeout=120)
+        elif config.AI_PROVIDER == "claude":
+            get_client().models.list(limit=1)
+    except Exception:
+        pass  # sin red/servidor: el primer turno real dara el error util
+
+
+# --- Ollama (LLM local) -------------------------------------------------------
+
+_ollama = httpx.Client(base_url=config.OLLAMA_URL, timeout=httpx.Timeout(120, connect=2))
+
+# Ollama usa el formato de herramientas de OpenAI; las nuestras estan en formato Anthropic.
+_OLLAMA_TOOLS = [
+    {"type": "function", "function": {
+        "name": t["name"], "description": t.get("description", ""), "parameters": t["input_schema"],
+    }}
+    for t in TOOLS
+]
+
+_OLLAMA_OPTIONS = {"num_ctx": 8192, "temperature": 0.6}
+
+
+def _ollama_request(messages) -> dict:
+    return {
+        "model": config.OLLAMA_MODEL,
+        "messages": messages,
+        "tools": _OLLAMA_TOOLS,
+        "stream": True,
+        "think": False,          # qwen3 razona por defecto: lento y no hace falta aqui
+        "keep_alive": -1,
+        "options": _OLLAMA_OPTIONS,
+    }
+
+
+def _call_ollama(on_sentence=None) -> str:
+    """Igual que _call_claude pero contra Ollama local (API nativa /api/chat, streaming)."""
+    messages = [{"role": "system", "content": _build_system_prompt()}] + list(_history)
+
+    for _ in range(10):  # tope de rondas de herramientas, por si el modelo entra en bucle
+        splitter = _SentenceSplitter(on_sentence) if on_sentence else None
+        text, tool_calls = "", []
+        with _ollama.stream("POST", "/api/chat", json=_ollama_request(messages)) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                msg = json.loads(line).get("message", {})
+                delta = msg.get("content") or ""
+                if delta:
+                    text += delta
+                    if splitter:
+                        splitter.feed(delta)
+                tool_calls += msg.get("tool_calls") or []
+        if splitter:
+            splitter.flush()
+
+        if not tool_calls:
+            return text.strip()
+
+        messages.append({"role": "assistant", "content": text, "tool_calls": tool_calls})
+        for call in tool_calls:
+            fn = call["function"]
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                args = json.loads(args or "{}")
+            print(f"  [Accediendo: {fn['name']}({next(iter(args.values()), '') if args else ''})]")
+            resultado = _execute_tool(fn["name"], args)
+            messages.append({"role": "tool", "tool_name": fn["name"], "content": str(resultado)})
+        # El system prompt incluye las acciones ejecutadas: refrescarlo para la siguiente ronda.
+        messages[0]["content"] = _build_system_prompt()
+
+    return "He tenido que parar: demasiados pasos seguidos con herramientas."
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?…:;])\s+|\n+")
+_MIN_CHUNK = 25  # no trocear en fragmentos muy cortos: suena entrecortado
+
+
+class _SentenceSplitter:
+    """Acumula deltas de texto y emite frases completas por on_sentence."""
+
+    def __init__(self, on_sentence):
+        self._on_sentence = on_sentence
+        self._buf = ""
+
+    def feed(self, delta: str) -> None:
+        self._buf += delta
+        while True:
+            m = None
+            for cand in _SENTENCE_END.finditer(self._buf):
+                if cand.start() >= _MIN_CHUNK:
+                    m = cand
+                    break
+            if not m:
+                return
+            sentence, self._buf = self._buf[:m.start()], self._buf[m.end():]
+            if sentence.strip():
+                self._on_sentence(sentence)
+
+    def flush(self) -> None:
+        if self._buf.strip():
+            self._on_sentence(self._buf)
+        self._buf = ""
+
+
+def _call_claude(on_sentence=None) -> str:
     """
     Llama a Claude con soporte de herramientas.
     Bucle: si Claude pide una herramienta -> ejecutar -> devolver resultado -> repetir.
+    Si se pasa on_sentence, el texto se emite por frases segun se genera.
     """
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_KEY)
+    client = get_client()
 
     # Copia de trabajo para este turno.
     # Los mensajes intermedios de herramientas no se guardan en _history
@@ -160,13 +306,20 @@ def _call_claude() -> str:
     working_messages = list(_history)
 
     while True:
-        response = client.messages.create(
+        splitter = _SentenceSplitter(on_sentence) if on_sentence else None
+        with client.messages.stream(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=_build_system_prompt(),
             tools=TOOLS,
             messages=working_messages
-        )
+        ) as stream:
+            for delta in stream.text_stream:
+                if splitter:
+                    splitter.feed(delta)
+            response = stream.get_final_message()
+        if splitter:
+            splitter.flush()
 
         if response.stop_reason == "tool_use":
             # Claude quiere usar herramientas
@@ -219,7 +372,7 @@ def _execute_tool(name: str, tool_input: dict) -> str:
     try:
         resultado = module.execute(name, tool_input)
     except system_tools.NeedsConfirmation as exc:
-        resultado = _confirm_dangerous_command(exc.command)
+        resultado = _confirm_dangerous_command(exc.command, exc.run)
     except Exception as e:
         logger.log_error(f"Fallo ejecutando {name}({tool_input}): {e}")
         resultado = f"Error ejecutando la herramienta: {e}"
@@ -232,7 +385,7 @@ def _execute_tool(name: str, tool_input: dict) -> str:
     return resultado
 
 
-def _confirm_dangerous_command(command: str) -> str:
+def _confirm_dangerous_command(command: str, run) -> str:
     """
     Pide confirmacion hablada antes de ejecutar un comando que coincide con
     un patron peligroso. Silencia el listener continuo mientras dura el
@@ -253,14 +406,24 @@ def _confirm_dangerous_command(command: str) -> str:
         tts.speak("Solo el propietario puede autorizar esto.")
         return "Accion rechazada: la voz que lo pidio no es la del propietario. No se ha ejecutado el comando."
 
+    # Si ya se esta hablando por streaming (texto previo a la herramienta),
+    # esperar a que acabe para no pisar la pregunta de confirmacion.
+    stream = tts.active_stream()
+    if stream:
+        stream.wait_idle()
+
     if _listener:
         _listener.mute()
     try:
-        tts.speak(f"Vas a ejecutar: {command}. ¿Confirmas?")
+        tts.speak(f"Voy a {command}. ¿Confirmas?" if command.startswith("escribir ")
+                  else f"Vas a ejecutar: {command}. ¿Confirmas?")
         texto_respuesta, confirmante_es_propietario = _record_confirmation_reply()
     finally:
         if _listener:
             _listener.unmute()
+            if stream:
+                # El resto de la respuesta seguira hablandose: volver a mutear.
+                _listener.mute(on_barge_in=tts.stop)
 
     if hay_perfiles_enrolados and not confirmante_es_propietario:
         logger.log_confirmation(command, texto_respuesta, False)
@@ -271,7 +434,7 @@ def _confirm_dangerous_command(command: str) -> str:
     logger.log_confirmation(command, texto_respuesta, aprobado)
 
     if aprobado:
-        return f"[Confirmado por el usuario] {system_tools._execute_shell(command)}"
+        return f"[Confirmado por el usuario] {run()}"
 
     tts.speak("Cancelado.")
     return "El usuario canceló la acción. No se ha ejecutado el comando."

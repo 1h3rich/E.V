@@ -29,9 +29,18 @@ def _get_model():
         _model = WhisperModel(
             config.WHISPER_MODEL,
             device="cpu",       # Usamos CPU. Si tienes GPU NVIDIA, cambia a "cuda"
-            compute_type="int8" # int8 es más ligero que float32, igual de preciso para voz
+            compute_type="int8", # int8 es más ligero que float32, igual de preciso para voz
+            cpu_threads=8,       # por defecto son 4; la inferencia escala bien hasta ~8
         )
     return _model
+
+
+def warm_up() -> None:
+    """Carga el modelo y hace una inferencia en vacio para calentar los kernels."""
+    import numpy as np
+    model = _get_model()
+    segments, _ = model.transcribe(np.zeros(16000, dtype=np.float32), language="es", beam_size=1)
+    list(segments)
 
 
 def transcribe(audio_path: str) -> str:

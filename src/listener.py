@@ -30,7 +30,7 @@ BLOCK_DURATION = 0.03  # 30ms por bloque
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_DURATION)
 
 SILENCE_RMS_THRESHOLD = 500   # energia RMS (int16) por debajo de esto = silencio
-HANGOVER_SEC = 0.8            # silencio tras voz necesario para cerrar el turno
+HANGOVER_SEC = 0.55           # silencio tras voz necesario para cerrar el turno (era 0.8)
 MIN_SPEECH_SEC = 0.3          # turnos mas cortos que esto se descartan (ruido)
 MUTE_GRACE_SEC = 0.3          # gracia extra tras unmute() para evitar cola de eco
 

@@ -7,8 +7,13 @@ load_dotenv()
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_KEY", "")
 OPENAI_KEY = os.getenv("OPENAI_KEY", "")
 
-# Proveedor de IA: "claude" o "openai"
-AI_PROVIDER = os.getenv("AI_PROVIDER", "claude")
+# Proveedor de IA: "ollama" (local, gratis), "claude" u "openai"
+AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama")
+
+# LLM local via Ollama (ver ai_client._call_ollama). Si Ollama no responde y hay
+# ANTHROPIC_KEY, se cae automaticamente a Claude para no dejar a Ivy muda.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 # Modelo de Whisper local para transcribir tu voz
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")

@@ -47,6 +47,12 @@ def _load_profiles() -> dict:
     return _profiles
 
 
+def warm_up() -> None:
+    """Carga el codificador (torch) por adelantado si hay perfiles enrolados."""
+    if has_enrolled_profiles():
+        _get_encoder().embed_utterance(np.zeros(16000, dtype=np.float32))
+
+
 def reload_profiles() -> None:
     """Fuerza a releer data/voices/*.npy (usar tras enrolar una voz nueva)."""
     global _profiles

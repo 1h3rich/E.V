@@ -17,9 +17,11 @@ _MODEL_PATH (y _SPEAKER_ID si el modelo es multi-hablante).
 """
 
 import os
+import queue
 import re
+import shutil
 import subprocess
-import tempfile
+import threading
 import wave
 
 from piper import PiperVoice
@@ -81,28 +83,117 @@ def speak(text: str):
     if not text:
         return
 
-    temp_path = tempfile.mktemp(suffix='.wav', dir='/tmp')
-
+    # PCM crudo por stdin a pw-play (PipeWire), segun Piper va sintetizando:
+    # sin wav temporal y sin el arranque de mpv (~0.2 s menos por frase).
+    # Idea tomada del fork Aria. Si no hay pw-play, se usa mpv como antes.
+    proceso = None
     try:
-        with wave.open(temp_path, "wb") as wav_file:
-            _get_voice().synthesize_wav(text, wav_file, syn_config=_syn_config)
-
-        # mpv reproduce el WAV en modo silencioso (sin abrir ventana ni mostrar barra)
-        _current_process = subprocess.Popen(
-            ["mpv", "--no-video", "--really-quiet", temp_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        _current_process.wait()  # Esperamos a que termine
-
+        for chunk in _get_voice().synthesize(text, syn_config=_syn_config):
+            if proceso is None:
+                proceso = subprocess.Popen(
+                    _player_cmd(chunk.sample_rate, chunk.sample_channels),
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                _current_process = proceso
+            try:
+                proceso.stdin.write(chunk.audio_int16_bytes)
+            except BrokenPipeError:
+                break  # stop() corto la reproduccion
+        if proceso is not None:
+            try:
+                proceso.stdin.close()
+            except OSError:
+                pass
+            proceso.wait()
     finally:
         _current_process = None
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+
+
+_PW_PLAY = shutil.which("pw-play")
+
+
+def _player_cmd(rate: int, channels: int) -> list:
+    r, c = str(rate), str(channels)
+    if _PW_PLAY:
+        return [_PW_PLAY, "--raw", "--rate", r, "--channels", c, "--format", "s16", "-"]
+    return ["mpv", "--no-video", "--really-quiet", "--demuxer=rawaudio",
+            f"--demuxer-rawaudio-rate={r}", f"--demuxer-rawaudio-channels={c}",
+            "--demuxer-rawaudio-format=s16le", "-"]
+
+
+def warm_up() -> None:
+    """Carga el modelo y hace una sintesis corta para calentar onnxruntime."""
+    voice = _get_voice()
+    with wave.open(os.devnull, "wb") as wav_file:
+        voice.synthesize_wav("Hola.", wav_file, syn_config=_syn_config)
+
+
+class SpeechStream:
+    """
+    Habla frases segun van llegando (p.ej. mientras el LLM sigue generando).
+    Un hilo consume la cola: sintetiza y reproduce cada frase en orden, asi la
+    primera frase suena sin esperar a que termine la respuesta completa.
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._cancelled = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def say(self, text: str) -> None:
+        if not self._cancelled and text and text.strip():
+            self._queue.put(text)
+
+    def finish(self) -> None:
+        """Espera a que se diga todo lo encolado y cierra el stream."""
+        global _active_stream
+        self._queue.put(None)
+        self._thread.join()
+        if _active_stream is self:
+            _active_stream = None
+
+    def wait_idle(self) -> None:
+        """Espera a que la cola actual se vacie (sin cerrar el stream)."""
+        self._queue.join()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        try:
+            while True:
+                self._queue.get_nowait()
+                self._queue.task_done()
+        except queue.Empty:
+            pass
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                if not self._cancelled:
+                    speak(item)
+            finally:
+                self._queue.task_done()
+
+
+_active_stream = None
+
+
+def start_stream() -> SpeechStream:
+    global _active_stream
+    _active_stream = SpeechStream()
+    return _active_stream
+
+
+def active_stream():
+    return _active_stream
 
 
 def stop():
-    """Cancela la reproduccion si esta sonando algo."""
-    global _current_process
+    """Cancela la reproduccion (y las frases pendientes) si hay algo sonando."""
+    if _active_stream:
+        _active_stream.cancel()
     if _current_process and _current_process.poll() is None:
         _current_process.terminate()
